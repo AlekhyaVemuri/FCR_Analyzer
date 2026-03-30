@@ -39,9 +39,5 @@ An automated Customer Support KPI dashboard that calculates the **First Contact 
 4. **Upload your `.xlsx` file** and click **"Run FCR Analysis"**.
 5. View your real-time FCR gauge chart and download the updated report! 
 
-## 📂 Expected Excel Format
-Ensure your uploaded `.xlsx` file includes exactly these column names (others can be present but will be ignored):
-| Ticket ID | Work Notes |
-| :--- | :--- |
-| TKT-001 | Customer called about password reset. Sent reset link. Issue resolved. |
-| TKT-002 | User reported network lag. Asked for logs. User replied. Fixed port config. |
+## UI & XPU Usage
+![alt text](ui.png "UI & XPU Usage")
