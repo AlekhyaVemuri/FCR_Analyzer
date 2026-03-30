@@ -5,7 +5,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import plotly.graph_objects as go
 
 # -------------------------------------------------------------------
-# 1. Native PyTorch XPU LLM Setup (Using Qwen 4)
+# 1. Native PyTorch XPU LLM Setup
 # -------------------------------------------------------------------
 @st.cache_resource
 def load_llm():
@@ -31,37 +31,46 @@ def load_llm():
     return tokenizer, model, device
 
 # -------------------------------------------------------------------
-# 2. Extract Data & Analyze Work Notes using Qwen 4
+# 2. Extract Data & Analyze Work Notes using Strict Prompting
 # -------------------------------------------------------------------
 def analyze_fcr_with_llm(row, notes_col, created_col, closed_col, tokenizer, model, device):
-    """
-    Evaluates FCR by looking at Work Notes alongside the Creation and Closure dates.
-    Instructs the LLM that multiple system timestamps do not mean multiple customer interactions.
-    """
     notes = str(row[notes_col]) if notes_col else "No notes provided"
     created = str(row[created_col]) if created_col and pd.notna(row[created_col]) else "Unknown"
     closed = str(row[closed_col]) if closed_col and pd.notna(row[closed_col]) else "Unknown"
 
-    # Contextual Prompt instructing the LLM on ITSM realities
-    prompt = f"""Analyze the following IT support ticket to determine if it meets First Contact Resolution (FCR).
+    # Python calculates the exact duration to help the LLM understand the timeline
+    duration_str = "Unknown"
+    if created != "Unknown" and closed != "Unknown":
+        try:
+            created_dt = pd.to_datetime(created)
+            closed_dt = pd.to_datetime(closed)
+            minutes = (closed_dt - created_dt).total_seconds() / 60.0
+            if minutes < 60:
+                duration_str = f"{int(minutes)} minutes"
+            else:
+                duration_str = f"{round(minutes/60, 1)} hours"
+        except Exception:
+            pass
 
-FCR Definition: 
-The issue was resolved by the agent without needing to request more information from the customer. 
+    # Highly structured prompt with strict constraints
+    prompt = f"""You are a strict data classification AI. Your ONLY job is to output the exact word "YES" or "NO". Do not write anything else.
 
-CRITICAL RULES: 
-1. "Work notes" often contain multiple system timestamps, assignment logs, or consecutive updates by the SAME agent. This does NOT mean multiple interactions! As long as the customer wasn't asked to reply back, it is an FCR.
-2. Look at the Created and Closed times. If the ticket was resolved shortly after creation (e.g., within minutes or hours), it is highly likely an FCR.
+Read the following IT ticket data and determine if it is a First Contact Resolution (FCR).
 
-Ticket Details:
-- Created: {created}
-- Closed: {closed}
-- Work Notes:
-{notes}
+FCR Rules:
+- Output YES if the agent resolved the issue and closed the ticket without asking the customer for more information.
+- Output YES if the "Time Elapsed" is very short (e.g., minutes). Multiple system logs from the SAME agent are fine.
+- Output NO if the agent asked a question and had to wait for the customer to reply back.
+- Output NO if the ticket was reassigned multiple times over several days.
 
-Answer with ONLY "YES" if it was resolved on the first contact, or "NO" if it required back-and-forth communication with the customer."""
+Ticket Data:
+- Time Elapsed: {duration_str}
+- Work Notes: {notes[:1500]}
+
+Is this an FCR? Answer ONLY YES or NO:"""
 
     messages =[
-        {"role": "system", "content": "You are an expert IT data analyst. Your only job is to evaluate tickets and output exactly 'YES' or 'NO'."},
+        {"role": "system", "content": "You are a strict data extraction assistant. You output only one word: YES or NO."},
         {"role": "user", "content": prompt}
     ]
     
@@ -71,8 +80,8 @@ Answer with ONLY "YES" if it was resolved on the first contact, or "NO" if it re
     with torch.no_grad():
         outputs = model.generate(
             **inputs, 
-            max_new_tokens=10, 
-            temperature=0.1, 
+            max_new_tokens=3,  # STRICLY limits output so it CANNOT ramble or "think"
+            temperature=0.01,  # Near-zero temperature for absolute determinism
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         )
@@ -80,8 +89,10 @@ Answer with ONLY "YES" if it was resolved on the first contact, or "NO" if it re
     generated_ids = outputs[0][inputs.input_ids.shape[-1]:]
     response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip().upper()
     
-    # Return boolean status and the raw text for debugging
-    return "YES" in response, response
+    # Simple, clean evaluation since we forced the model's hand
+    is_fcr = response == "YES"
+
+    return is_fcr, response
 
 # -------------------------------------------------------------------
 # 3. Streamlit UI Dashboard
@@ -89,10 +100,9 @@ Answer with ONLY "YES" if it was resolved on the first contact, or "NO" if it re
 def main():
     st.set_page_config(page_title="Intel Customer Support KPI Dashboard", layout="wide")
     st.title("📊 Customer Support KPI: First Contact Resolution (FCR)")
-    st.markdown("Target: **Close 70% of tickets in the first follow-up.** Powered by **Qwen 4** on Native PyTorch XPU.")
+    st.markdown("Automated FCR calculation using Work Notes, Open, and Close dates. Powered by **Qwen3-1.7B** on Native PyTorch XPU.")
 
-    # Load LLM
-    with st.spinner("Loading Qwen 4 on Intel XPU..."):
+    with st.spinner("Loading Qwen3-1.7B on Intel XPU..."):
         tokenizer, model, device = load_llm()
 
     uploaded_file = st.file_uploader("Upload Ticket Data (.xlsx)", type=["xlsx"])
@@ -100,7 +110,7 @@ def main():
     if uploaded_file is not None:
         df = pd.read_excel(uploaded_file)
         
-        # Auto-detect columns based on the screenshot provided
+        # Auto-detect columns
         ticket_col = "Number" if "Number" in df.columns else "Ticket ID" if "Ticket ID" in df.columns else df.columns[0]
         notes_col = "Work notes" if "Work notes" in df.columns else "Work Notes" if "Work Notes" in df.columns else None
         created_col = "Created" if "Created" in df.columns else None
@@ -119,7 +129,7 @@ def main():
             
             for idx, row in df.iterrows():
                 ticket_id = row[ticket_col]
-                status_text.text(f"Analyzing ticket {ticket_id} on XPU...")
+                status_text.text(f"Analyzing ticket {ticket_id} on XPU... ({idx+1}/{len(df)})")
                 
                 is_fcr, raw_output = analyze_fcr_with_llm(
                     row, notes_col, created_col, closed_col, tokenizer, model, device
@@ -131,10 +141,10 @@ def main():
                 progress_bar.progress((idx + 1) / len(df))
             
             df["FCR Status"] = fcr_results
-            df["Raw LLM Output"] = raw_llm_outputs  # Added for transparency
+            df["Raw LLM Output"] = raw_llm_outputs  
             status_text.text("Analysis Complete!")
             
-            # Calculate KPIs
+            # Straightforward Percentage Calculation
             total_tickets = len(df)
             fcr_count = len(df[df["FCR Status"] == "Resolved on First Contact"])
             fcr_rate = (fcr_count / total_tickets) * 100 if total_tickets > 0 else 0
@@ -147,36 +157,30 @@ def main():
                 st.subheader("KPI Summary")
                 st.metric(label="Total Tickets Analyzed", value=total_tickets)
                 st.metric(label="First Contact Resolutions", value=fcr_count)
-                
-                delta_color = "normal" if fcr_rate >= 70 else "inverse"
-                st.metric(label="FCR Rate (Target: 70%)", value=fcr_rate, delta=fcr_rate - 70, delta_color=delta_color)
+                st.metric(label="FCR Percentage", value=f"{fcr_rate:.1f}%")
 
             with col2:
+                # Clean Gauge Chart without the 70% delta logic
                 fig = go.Figure(go.Indicator(
-                    mode = "gauge+number+delta",
+                    mode = "gauge+number",
                     value = fcr_rate,
-                    domain = {'x': [0, 1], 'y':[0, 1]},
-                    title = {'text': "FCR Rate (%)", 'font': {'size': 24}},
-                    delta = {'reference': 70, 'increasing': {'color': "green"}, 'decreasing': {'color': "red"}},
+                    domain = {'x': [0, 1], 'y': [0, 1]},
+                    title = {'text': "Actual FCR Rate (%)", 'font': {'size': 24}},
+                    number = {'suffix': "%", 'valueformat': ".1f"},
                     gauge = {
-                        'axis': {'range':[0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
+                        'axis': {'range': [0, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
                         'bar': {'color': "darkblue"},
                         'bgcolor': "white",
                         'borderwidth': 2,
                         'bordercolor': "gray",
                         'steps': [
-                            {'range':[0, 70], 'color': 'lightcoral'},
-                            {'range': [70, 100], 'color': 'lightgreen'}],
-                        'threshold': {
-                            'line': {'color': "black", 'width': 4},
-                            'thickness': 0.75,
-                            'value': 70}
+                            {'range': [0, 100], 'color': 'lightgray'}
+                        ]
                     }
                 ))
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("Ticket Details")
-            # Display dataframe highlighting the output
             st.dataframe(df[[ticket_col, created_col, closed_col, "FCR Status", "Raw LLM Output", notes_col]], use_container_width=True)
 
             output_xlsx = "fcr_analysis_report.xlsx"
